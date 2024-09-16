@@ -9,7 +9,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 ETHERSCAN_API_URL = 'https://api.etherscan.io/api'
 
-def get_api_key():
+def get_api_key() -> str:
     """
     Retrieve the Etherscan API key from environment variables.
     
@@ -22,14 +22,14 @@ def get_api_key():
         sys.exit(1)
     return api_key
 
-def fetch_data_from_etherscan(params, api_key):
+def fetch_data_from_etherscan(params: dict, api_key: str) -> Optional[dict]:
     """
-    Generic function to fetch data from Etherscan API.
-    
+    Generic function to fetch data from the Etherscan API.
+
     Args:
         params (dict): Parameters for the API request.
         api_key (str): The Etherscan API key.
-        
+
     Returns:
         dict or None: The JSON response from Etherscan if successful, None otherwise.
     """
@@ -38,56 +38,51 @@ def fetch_data_from_etherscan(params, api_key):
         response = requests.get(ETHERSCAN_API_URL, params=params)
         response.raise_for_status()
         data = response.json()
-        
+
         if data.get('status') == '0':
-            logging.error(f"Etherscan API returned an error: {data.get('message', 'Unknown error')}")
+            logging.error(f"Etherscan API error: {data.get('message', 'Unknown error')}")
             return None
-        
+
         return data
-    
-    except requests.exceptions.HTTPError as http_err:
-        logging.error(f"HTTP error occurred: {http_err}")
-    except requests.exceptions.ConnectionError as conn_err:
-        logging.error(f"Connection error occurred: {conn_err}")
-    except requests.exceptions.Timeout as timeout_err:
-        logging.error(f"Timeout error occurred: {timeout_err}")
-    except requests.exceptions.RequestException as req_err:
-        logging.error(f"An error occurred: {req_err}")
+
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Network error while fetching data: {e}")
+    except json.JSONDecodeError:
+        logging.error("Failed to parse JSON response.")
     
     return None
 
-def get_latest_block_number(api_key):
+def get_latest_block_number(api_key: str) -> Optional[int]:
     """
     Get the latest Ethereum block number.
-    
+
     Args:
         api_key (str): The Etherscan API key.
-        
+
     Returns:
-        int or None: The latest block number or None if there was an error.
+        int or None: The latest block number, or None if there was an error.
     """
     params = {'module': 'proxy', 'action': 'eth_blockNumber'}
     data = fetch_data_from_etherscan(params, api_key)
-    
+
     if data and 'result' in data:
         try:
             return int(data['result'], 16)
         except ValueError:
-            logging.error("Failed to parse block number from Etherscan response.")
+            logging.error("Failed to parse block number from response.")
     
-    logging.error("Invalid data received for the latest block number.")
     return None
 
-def get_block_transaction_count(block_number, api_key):
+def get_block_transaction_count(block_number: int, api_key: str) -> Optional[int]:
     """
     Get the number of transactions in a specific block.
-    
+
     Args:
         block_number (int): The block number.
         api_key (str): The Etherscan API key.
-        
+
     Returns:
-        int or None: The transaction count or None if there was an error.
+        int or None: The transaction count, or None if there was an error.
     """
     params = {
         'module': 'proxy',
@@ -95,26 +90,25 @@ def get_block_transaction_count(block_number, api_key):
         'tag': hex(block_number)
     }
     data = fetch_data_from_etherscan(params, api_key)
-    
+
     if data and 'result' in data:
         try:
             return int(data['result'], 16)
         except ValueError:
-            logging.error(f"Failed to parse transaction count from Etherscan response for block {block_number}.")
+            logging.error(f"Failed to parse transaction count for block {block_number}.")
     
-    logging.error(f"Invalid data received for transaction count in block {block_number}.")
     return None
 
-def get_first_transaction_in_block(block_number, api_key):
+def get_first_transaction_in_block(block_number: int, api_key: str) -> Optional[dict]:
     """
     Get the first transaction in a specific block.
-    
+
     Args:
         block_number (int): The block number.
         api_key (str): The Etherscan API key.
-        
+
     Returns:
-        dict or None: The first transaction details or None if there was an error.
+        dict or None: The first transaction details, or None if there was an error.
     """
     params = {
         'module': 'proxy',
@@ -123,7 +117,7 @@ def get_first_transaction_in_block(block_number, api_key):
         'boolean': 'true'
     }
     data = fetch_data_from_etherscan(params, api_key)
-    
+
     if data and 'result' in data:
         transactions = data['result'].get('transactions', [])
         if transactions:
