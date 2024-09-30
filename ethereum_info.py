@@ -3,6 +3,7 @@ import json
 import sys
 import os
 import logging
+from typing import Optional, Dict
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -19,10 +20,10 @@ def get_api_key() -> str:
     api_key = os.getenv('ETHERSCAN_API_KEY')
     if not api_key:
         logging.critical("Etherscan API key not found. Please set the ETHERSCAN_API_KEY environment variable.")
-        sys.exit(1)
+        raise EnvironmentError("Etherscan API key not set.")
     return api_key
 
-def fetch_data_from_etherscan(params: dict, api_key: str) -> Optional[dict]:
+def fetch_data_from_etherscan(params: Dict[str, str], api_key: str) -> Optional[Dict]:
     """
     Generic function to fetch data from the Etherscan API.
 
@@ -35,7 +36,7 @@ def fetch_data_from_etherscan(params: dict, api_key: str) -> Optional[dict]:
     """
     try:
         params['apikey'] = api_key
-        response = requests.get(ETHERSCAN_API_URL, params=params)
+        response = requests.get(ETHERSCAN_API_URL, params=params, timeout=10)
         response.raise_for_status()
         data = response.json()
 
@@ -45,6 +46,8 @@ def fetch_data_from_etherscan(params: dict, api_key: str) -> Optional[dict]:
 
         return data
 
+    except requests.exceptions.Timeout:
+        logging.error("Request timed out.")
     except requests.exceptions.RequestException as e:
         logging.error(f"Network error while fetching data: {e}")
     except json.JSONDecodeError:
@@ -130,31 +133,36 @@ def main():
     """
     Main function to orchestrate the fetching and displaying of Ethereum block data.
     """
-    api_key = get_api_key()
+    try:
+        api_key = get_api_key()
 
-    latest_block_number = get_latest_block_number(api_key)
-    if latest_block_number is None:
-        logging.critical("Could not retrieve the latest block number.")
-        sys.exit(1)
+        latest_block_number = get_latest_block_number(api_key)
+        if latest_block_number is None:
+            logging.critical("Could not retrieve the latest block number.")
+            raise RuntimeError("Failed to fetch the latest block number.")
 
-    logging.info(f'Latest Block Number: {latest_block_number}')
+        logging.info(f'Latest Block Number: {latest_block_number}')
 
-    transaction_count = get_block_transaction_count(latest_block_number, api_key)
-    if transaction_count is None:
-        logging.critical(f"Could not retrieve transaction count for block {latest_block_number}.")
-        sys.exit(1)
+        transaction_count = get_block_transaction_count(latest_block_number, api_key)
+        if transaction_count is None:
+            logging.critical(f"Could not retrieve transaction count for block {latest_block_number}.")
+            raise RuntimeError(f"Failed to fetch transaction count for block {latest_block_number}.")
 
-    logging.info(f'Transaction Count in Block {latest_block_number}: {transaction_count}')
+        logging.info(f'Transaction Count in Block {latest_block_number}: {transaction_count}')
 
-    if transaction_count > 0:
-        first_transaction = get_first_transaction_in_block(latest_block_number, api_key)
-        if first_transaction:
-            logging.info('First Transaction in Block:')
-            print(json.dumps(first_transaction, indent=4))
+        if transaction_count > 0:
+            first_transaction = get_first_transaction_in_block(latest_block_number, api_key)
+            if first_transaction:
+                logging.info('First Transaction in Block:')
+                print(json.dumps(first_transaction, indent=4))
+            else:
+                logging.info('No transactions in the latest block.')
         else:
             logging.info('No transactions in the latest block.')
-    else:
-        logging.info('No transactions in the latest block.')
+
+    except (EnvironmentError, RuntimeError) as e:
+        logging.critical(str(e))
+        sys.exit(1)
 
 if __name__ == "__main__":
     try:
