@@ -10,6 +10,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 ETHERSCAN_API_URL = 'https://api.etherscan.io/api'
 
+
 def get_api_key() -> str:
     """
     Retrieve the Etherscan API key from environment variables.
@@ -22,6 +23,7 @@ def get_api_key() -> str:
         logging.critical("Etherscan API key not found. Please set the ETHERSCAN_API_KEY environment variable.")
         raise EnvironmentError("Etherscan API key not set.")
     return api_key
+
 
 def fetch_data_from_etherscan(params: Dict[str, str], api_key: str) -> Optional[Dict]:
     """
@@ -45,7 +47,6 @@ def fetch_data_from_etherscan(params: Dict[str, str], api_key: str) -> Optional[
             return None
 
         return data
-
     except requests.exceptions.Timeout:
         logging.error("Request timed out.")
     except requests.exceptions.RequestException as e:
@@ -54,6 +55,7 @@ def fetch_data_from_etherscan(params: Dict[str, str], api_key: str) -> Optional[
         logging.error("Failed to parse JSON response.")
     
     return None
+
 
 def get_latest_block_number(api_key: str) -> Optional[int]:
     """
@@ -75,6 +77,7 @@ def get_latest_block_number(api_key: str) -> Optional[int]:
             logging.error("Failed to parse block number from response.")
     
     return None
+
 
 def get_block_transaction_count(block_number: int, api_key: str) -> Optional[int]:
     """
@@ -101,6 +104,7 @@ def get_block_transaction_count(block_number: int, api_key: str) -> Optional[int
             logging.error(f"Failed to parse transaction count for block {block_number}.")
     
     return None
+
 
 def get_first_transaction_in_block(block_number: int, api_key: str) -> Optional[dict]:
     """
@@ -129,40 +133,37 @@ def get_first_transaction_in_block(block_number: int, api_key: str) -> Optional[
     logging.warning(f"No transactions found in block {block_number}.")
     return None
 
+
 def main():
     """
     Main function to orchestrate the fetching and displaying of Ethereum block data.
     """
-    try:
-        api_key = get_api_key()
+    api_key = get_api_key()
 
-        latest_block_number = get_latest_block_number(api_key)
-        if latest_block_number is None:
-            logging.critical("Could not retrieve the latest block number.")
-            raise RuntimeError("Failed to fetch the latest block number.")
-
-        logging.info(f'Latest Block Number: {latest_block_number}')
-
-        transaction_count = get_block_transaction_count(latest_block_number, api_key)
-        if transaction_count is None:
-            logging.critical(f"Could not retrieve transaction count for block {latest_block_number}.")
-            raise RuntimeError(f"Failed to fetch transaction count for block {latest_block_number}.")
-
-        logging.info(f'Transaction Count in Block {latest_block_number}: {transaction_count}')
-
-        if transaction_count > 0:
-            first_transaction = get_first_transaction_in_block(latest_block_number, api_key)
-            if first_transaction:
-                logging.info('First Transaction in Block:')
-                print(json.dumps(first_transaction, indent=4))
-            else:
-                logging.info('No transactions in the latest block.')
-        else:
-            logging.info('No transactions in the latest block.')
-
-    except (EnvironmentError, RuntimeError) as e:
-        logging.critical(str(e))
+    latest_block_number = get_latest_block_number(api_key)
+    if latest_block_number is None:
+        logging.critical("Could not retrieve the latest block number.")
         sys.exit(1)
+
+    logging.info(f'Latest Block Number: {latest_block_number}')
+
+    transaction_count = get_block_transaction_count(latest_block_number, api_key)
+    if transaction_count is None:
+        logging.critical(f"Could not retrieve transaction count for block {latest_block_number}.")
+        sys.exit(1)
+
+    logging.info(f'Transaction Count in Block {latest_block_number}: {transaction_count}')
+
+    if transaction_count > 0:
+        first_transaction = get_first_transaction_in_block(latest_block_number, api_key)
+        if first_transaction:
+            logging.info('First Transaction in Block:')
+            print(json.dumps(first_transaction, indent=4))
+        else:
+            logging.info('No transactions found in the latest block.')
+    else:
+        logging.info('No transactions in the latest block.')
+
 
 if __name__ == "__main__":
     try:
