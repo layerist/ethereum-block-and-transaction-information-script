@@ -8,12 +8,21 @@ from typing import Optional, Dict, Any
 # Constants
 ETHERSCAN_API_URL = "https://api.etherscan.io/api"
 REQUEST_TIMEOUT = 10
+ETHERSCAN_API_MODULES = {
+    "proxy": "proxy",
+}
+ETHERSCAN_ACTIONS = {
+    "latest_block": "eth_blockNumber",
+    "transaction_count": "eth_getBlockTransactionCountByNumber",
+    "block_by_number": "eth_getBlockByNumber",
+}
 
 # Logging configuration
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
+
 
 def get_api_key() -> str:
     """
@@ -32,6 +41,7 @@ def get_api_key() -> str:
         )
         raise EnvironmentError("Etherscan API key not set.")
     return api_key
+
 
 def fetch_data_from_etherscan(params: Dict[str, str], api_key: str) -> Optional[Dict[str, Any]]:
     """
@@ -55,13 +65,14 @@ def fetch_data_from_etherscan(params: Dict[str, str], api_key: str) -> Optional[
             return None
 
         return data
-    except requests.Timeout:
+    except requests.exceptions.Timeout:
         logging.error("Request to Etherscan API timed out.")
-    except requests.RequestException as e:
+    except requests.exceptions.RequestException as e:
         logging.error(f"Network error while accessing Etherscan API: {e}")
     except json.JSONDecodeError:
         logging.error("Failed to decode JSON response from Etherscan API.")
     return None
+
 
 def get_latest_block_number(api_key: str) -> Optional[int]:
     """
@@ -73,7 +84,7 @@ def get_latest_block_number(api_key: str) -> Optional[int]:
     Returns:
         Optional[int]: The latest block number, or None if an error occurred.
     """
-    params = {"module": "proxy", "action": "eth_blockNumber"}
+    params = {"module": ETHERSCAN_API_MODULES["proxy"], "action": ETHERSCAN_ACTIONS["latest_block"]}
     data = fetch_data_from_etherscan(params, api_key)
 
     if data and "result" in data:
@@ -82,6 +93,7 @@ def get_latest_block_number(api_key: str) -> Optional[int]:
         except ValueError:
             logging.error("Failed to parse block number from Etherscan API response.")
     return None
+
 
 def get_block_transaction_count(block_number: int, api_key: str) -> Optional[int]:
     """
@@ -95,8 +107,8 @@ def get_block_transaction_count(block_number: int, api_key: str) -> Optional[int
         Optional[int]: The transaction count, or None if an error occurred.
     """
     params = {
-        "module": "proxy",
-        "action": "eth_getBlockTransactionCountByNumber",
+        "module": ETHERSCAN_API_MODULES["proxy"],
+        "action": ETHERSCAN_ACTIONS["transaction_count"],
         "tag": hex(block_number),
     }
     data = fetch_data_from_etherscan(params, api_key)
@@ -107,6 +119,7 @@ def get_block_transaction_count(block_number: int, api_key: str) -> Optional[int
         except ValueError:
             logging.error(f"Failed to parse transaction count for block {block_number}.")
     return None
+
 
 def get_first_transaction_in_block(block_number: int, api_key: str) -> Optional[Dict[str, Any]]:
     """
@@ -120,8 +133,8 @@ def get_first_transaction_in_block(block_number: int, api_key: str) -> Optional[
         Optional[Dict[str, Any]]: Details of the first transaction, or None if an error occurred.
     """
     params = {
-        "module": "proxy",
-        "action": "eth_getBlockByNumber",
+        "module": ETHERSCAN_API_MODULES["proxy"],
+        "action": ETHERSCAN_ACTIONS["block_by_number"],
         "tag": hex(block_number),
         "boolean": "true",
     }
@@ -134,6 +147,7 @@ def get_first_transaction_in_block(block_number: int, api_key: str) -> Optional[
 
     logging.warning(f"No transactions found in block {block_number}.")
     return None
+
 
 def main():
     """
@@ -172,6 +186,7 @@ def main():
     except EnvironmentError as e:
         logging.critical(e)
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
