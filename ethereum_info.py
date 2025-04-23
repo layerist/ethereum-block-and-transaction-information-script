@@ -1,138 +1,151 @@
-import requests
+#!/usr/bin/env python3
+import argparse
+import atexit
 import json
-import sys
-import os
 import logging
-from typing import Optional, Dict, Any
+import os
+import sys
+from typing import Any, Dict, Optional
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # Constants
 ETHERSCAN_API_URL = "https://api.etherscan.io/api"
-REQUEST_TIMEOUT = 10
-ETHERSCAN_API_MODULE = "proxy"
-
+REQUEST_TIMEOUT = 10  # seconds
+ETHERSCAN_MODULE = "proxy"
 ETHERSCAN_ACTIONS = {
     "latest_block": "eth_blockNumber",
-    "transaction_count": "eth_getBlockTransactionCountByNumber",
+    "tx_count": "eth_getBlockTransactionCountByNumber",
     "block_by_number": "eth_getBlockByNumber",
 }
 
-# Logging configuration
+# Logging
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
+    format="%(asctime)s %(levelname)s %(message)s",
 )
 
+
+class EtherscanAPIError(Exception):
+    """Raised when Etherscan returns an error status."""
+
+
 def get_api_key() -> str:
-    """Retrieve the Etherscan API key from environment variables."""
-    api_key = os.getenv("ETHERSCAN_API_KEY")
-    if not api_key:
-        logging.critical("Etherscan API key not found. Set the 'ETHERSCAN_API_KEY' environment variable.")
+    key = os.getenv("ETHERSCAN_API_KEY")
+    if not key:
+        logging.critical("Environment variable ETHERSCAN_API_KEY is missing.")
         sys.exit(1)
-    return api_key
+    return key
 
 
-def fetch_data_from_etherscan(params: Dict[str, str], api_key: str) -> Optional[Dict[str, Any]]:
-    """Fetch data from the Etherscan API with error handling."""
+def make_session(retries: int = 3, backoff_factor: float = 0.3) -> requests.Session:
+    session = requests.Session()
+    retry = Retry(
+        total=retries,
+        backoff_factor=backoff_factor,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+def fetch_etherscan(
+    session: requests.Session, params: Dict[str, str], api_key: str
+) -> Dict[str, Any]:
     params["apikey"] = api_key
     try:
-        response = requests.get(ETHERSCAN_API_URL, params=params, timeout=REQUEST_TIMEOUT)
-        response.raise_for_status()
-        data = response.json()
+        resp = session.get(ETHERSCAN_API_URL, params=params, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.RequestException as e:
+        logging.error(f"Network/API request error: {e}")
+        raise
 
-        if data.get("status") == "0":
-            logging.error(f"Etherscan API error: {data.get('message', 'Unknown error')}")
-            return None
+    if data.get("status") == "0":
+        msg = data.get("message", "Unknown error")
+        logging.error(f"Etherscan API error: {msg}")
+        raise EtherscanAPIError(msg)
 
-        return data
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Network error: {e}")
-    except json.JSONDecodeError:
-        logging.error("Failed to decode JSON response.")
-    return None
-
-
-def get_latest_block_number(api_key: str) -> Optional[int]:
-    """Retrieve the latest Ethereum block number."""
-    params = {"module": ETHERSCAN_API_MODULE, "action": ETHERSCAN_ACTIONS["latest_block"]}
-    data = fetch_data_from_etherscan(params, api_key)
-
-    if data and "result" in data:
-        try:
-            return int(data["result"], 16)
-        except ValueError:
-            logging.error("Invalid block number format.")
-    return None
+    return data
 
 
-def get_block_transaction_count(block_number: int, api_key: str) -> Optional[int]:
-    """Retrieve the number of transactions in a specific block."""
+def get_latest_block(session: requests.Session, api_key: str) -> int:
+    params = {"module": ETHERSCAN_MODULE, "action": ETHERSCAN_ACTIONS["latest_block"]}
+    data = fetch_etherscan(session, params, api_key)
+    hexnum = data["result"]
+    return int(hexnum, 16)
+
+
+def get_tx_count(session: requests.Session, block_number: int, api_key: str) -> int:
     params = {
-        "module": ETHERSCAN_API_MODULE,
-        "action": ETHERSCAN_ACTIONS["transaction_count"],
+        "module": ETHERSCAN_MODULE,
+        "action": ETHERSCAN_ACTIONS["tx_count"],
         "tag": hex(block_number),
     }
-    data = fetch_data_from_etherscan(params, api_key)
-
-    if data and "result" in data:
-        try:
-            return int(data["result"], 16)
-        except ValueError:
-            logging.error(f"Invalid transaction count format for block {block_number}.")
-    return None
+    data = fetch_etherscan(session, params, api_key)
+    return int(data["result"], 16)
 
 
-def get_first_transaction_in_block(block_number: int, api_key: str) -> Optional[Dict[str, Any]]:
-    """Retrieve the first transaction in a specific block."""
+def get_first_tx(session: requests.Session, block_number: int, api_key: str) -> Optional[Dict[str, Any]]:
     params = {
-        "module": ETHERSCAN_API_MODULE,
+        "module": ETHERSCAN_MODULE,
         "action": ETHERSCAN_ACTIONS["block_by_number"],
         "tag": hex(block_number),
         "boolean": "true",
     }
-    data = fetch_data_from_etherscan(params, api_key)
+    data = fetch_etherscan(session, params, api_key)
+    txs = data["result"].get("transactions", [])
+    return txs[0] if txs else None
 
-    if data and "result" in data:
-        transactions = data["result"].get("transactions", [])
-        return transactions[0] if transactions else None
 
-    logging.warning(f"No transactions found in block {block_number}.")
-    return None
+def shutdown_handler() -> None:
+    logging.info("Exiting cleanly.")
 
 
 def main() -> None:
-    """Main function to retrieve Ethereum block data."""
+    atexit.register(shutdown_handler)
+
+    parser = argparse.ArgumentParser(description="Ethereum block inspector via Etherscan API")
+    parser.add_argument("--first-tx", action="store_true", help="Fetch the first transaction in the latest block")
+    args = parser.parse_args()
+
     api_key = get_api_key()
-    latest_block_number = get_latest_block_number(api_key)
+    session = make_session()
 
-    if latest_block_number is None:
-        logging.critical("Failed to retrieve the latest block number.")
+    try:
+        block_num = get_latest_block(session, api_key)
+    except Exception:
+        logging.critical("Could not retrieve latest block.")
         sys.exit(1)
 
-    logging.info(f"Latest Block Number: {latest_block_number}")
+    logging.info(f"Latest block: {block_num}")
 
-    transaction_count = get_block_transaction_count(latest_block_number, api_key)
-    if transaction_count is None:
-        logging.critical(f"Failed to retrieve transaction count for block {latest_block_number}.")
+    try:
+        tx_count = get_tx_count(session, block_num, api_key)
+    except Exception:
+        logging.critical(f"Could not retrieve transaction count for block {block_num}.")
         sys.exit(1)
 
-    logging.info(f"Transaction Count in Block {latest_block_number}: {transaction_count}")
+    logging.info(f"Transactions in block {block_num}: {tx_count}")
 
-    if transaction_count > 0:
-        first_transaction = get_first_transaction_in_block(latest_block_number, api_key)
-        if first_transaction:
-            logging.info("First Transaction in Block:")
-            print(json.dumps(first_transaction, indent=4))
-        else:
-            logging.info("No transactions found in the latest block.")
-    else:
-        logging.info("No transactions in the latest block.")
-
-    sys.exit(0)
+    if args.first_tx:
+        if tx_count == 0:
+            logging.info("No transactions in the latest block.")
+            return
+        try:
+            tx = get_first_tx(session, block_num, api_key)
+            if tx:
+                print(json.dumps(tx, indent=4))
+            else:
+                logging.info("Block contains no transactions.")
+        except Exception:
+            logging.error(f"Failed to fetch first transaction from block {block_num}.")
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        logging.info("Script interrupted by user.")
-        sys.exit(0)
+    main()
