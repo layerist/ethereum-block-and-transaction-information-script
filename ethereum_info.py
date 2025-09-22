@@ -9,9 +9,17 @@ from typing import Any, Dict, List, Optional, Tuple, Callable
 import requests
 from functools import wraps
 
+# -------------------------------------------------------------------
 # Logging configuration
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# -------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
 
+# -------------------------------------------------------------------
+# Configuration
+# -------------------------------------------------------------------
 @dataclass(frozen=True)
 class Config:
     BASE_URL: str = "https://api.etherscan.io/api"
@@ -25,8 +33,11 @@ class Config:
         "hash", "blockNumber", "timeStamp", "from", "to", "value", "gas", "gasPrice"
     )
 
+# -------------------------------------------------------------------
+# Retry decorator
+# -------------------------------------------------------------------
 def retry_request(func: Callable) -> Callable:
-    """Decorator to retry a request function with exponential backoff."""
+    """Retry a request function with exponential backoff."""
     @wraps(func)
     def wrapper(*args, **kwargs):
         delay = Config.RETRY_DELAY
@@ -37,11 +48,14 @@ def retry_request(func: Callable) -> Callable:
                 logging.warning(f"[Retry {attempt}/{Config.RETRY_COUNT}] {e}")
                 if attempt < Config.RETRY_COUNT:
                     sleep(delay)
-                    delay *= 2  # exponential backoff
-        logging.error("Max retries reached, giving up.")
+                    delay *= 2
+        logging.error("Max retries reached, aborting.")
         return None
     return wrapper
 
+# -------------------------------------------------------------------
+# API request helper
+# -------------------------------------------------------------------
 @retry_request
 def make_request(params: Dict[str, str]) -> Optional[Dict[str, Any]]:
     """Send a GET request to the Etherscan API."""
@@ -58,11 +72,17 @@ def make_request(params: Dict[str, str]) -> Optional[Dict[str, Any]]:
         return None
     return data
 
+# -------------------------------------------------------------------
+# Etherscan API wrappers
+# -------------------------------------------------------------------
 def get_eth_balance(address: str, api_key: str) -> Optional[float]:
     """Fetch ETH balance for an address."""
     params = {
-        "module": "account", "action": "balance",
-        "address": address, "tag": "latest", "apikey": api_key
+        "module": "account",
+        "action": "balance",
+        "address": address,
+        "tag": "latest",
+        "apikey": api_key,
     }
     data = make_request(params)
     try:
@@ -74,9 +94,13 @@ def get_eth_balance(address: str, api_key: str) -> Optional[float]:
 def get_last_transactions(address: str, api_key: str, count: int) -> List[Dict[str, Any]]:
     """Fetch recent ETH transactions for an address."""
     params = {
-        "module": "account", "action": "txlist",
-        "address": address, "startblock": "0", "endblock": "99999999",
-        "sort": "desc", "apikey": api_key
+        "module": "account",
+        "action": "txlist",
+        "address": address,
+        "startblock": "0",
+        "endblock": "99999999",
+        "sort": "desc",
+        "apikey": api_key,
     }
     data = make_request(params)
     return data["result"][:count] if data and "result" in data else []
@@ -91,11 +115,22 @@ def get_eth_price(api_key: str) -> Optional[float]:
         logging.exception(f"Failed to parse ETH price: {e}")
         return None
 
+# -------------------------------------------------------------------
+# Helpers
+# -------------------------------------------------------------------
 def calculate_transaction_totals(transactions: List[Dict[str, Any]], address: str) -> Tuple[float, float]:
     """Calculate total ETH received and sent by an address."""
     addr = address.lower()
-    received = sum(int(tx.get("value", 0)) / Config.WEI_TO_ETH for tx in transactions if tx.get("to", "").lower() == addr)
-    sent = sum(int(tx.get("value", 0)) / Config.WEI_TO_ETH for tx in transactions if tx.get("from", "").lower() == addr)
+    received = sum(
+        int(tx.get("value", 0)) / Config.WEI_TO_ETH
+        for tx in transactions
+        if tx.get("to", "").lower() == addr
+    )
+    sent = sum(
+        int(tx.get("value", 0)) / Config.WEI_TO_ETH
+        for tx in transactions
+        if tx.get("from", "").lower() == addr
+    )
     return received, sent
 
 def save_transactions_to_csv(transactions: List[Dict[str, Any]], filename: str) -> None:
@@ -105,39 +140,53 @@ def save_transactions_to_csv(transactions: List[Dict[str, Any]], filename: str) 
         return
 
     try:
-        with Path(filename).open("w", newline="", encoding="utf-8") as csvfile:
+        path = Path(filename)
+        with path.open("w", newline="", encoding="utf-8") as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=Config.CSV_FIELDS)
             writer.writeheader()
             for tx in transactions:
                 writer.writerow({
                     "hash": tx.get("hash", ""),
                     "blockNumber": tx.get("blockNumber", ""),
-                    "timeStamp": _format_timestamp(tx.get("timeStamp")),
+                    "timeStamp": format_timestamp(tx.get("timeStamp")),
                     "from": tx.get("from", ""),
                     "to": tx.get("to", ""),
                     "value": round(int(tx.get("value", 0)) / Config.WEI_TO_ETH, 8),
                     "gas": tx.get("gas", ""),
                     "gasPrice": tx.get("gasPrice", ""),
                 })
-        logging.info(f"Saved {len(transactions)} transactions to '{Path(filename).resolve()}'")
+        logging.info(f"Saved {len(transactions)} transactions to '{path.resolve()}'")
     except IOError as e:
         logging.error(f"Failed to write CSV: {e}")
 
-def _format_timestamp(ts: Any) -> str:
+def format_timestamp(ts: Any) -> str:
     """Convert UNIX timestamp to ISO string."""
     try:
         return datetime.utcfromtimestamp(int(ts)).isoformat()
     except (ValueError, TypeError):
         return ""
 
+# -------------------------------------------------------------------
+# Main
+# -------------------------------------------------------------------
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Fetch ETH balance & transactions from Etherscan.")
+    parser = argparse.ArgumentParser(
+        description="Fetch ETH balance and transactions from Etherscan."
+    )
     parser.add_argument("address", help="Ethereum wallet address")
     parser.add_argument("apikey", help="Etherscan API key")
-    parser.add_argument("--count", type=int, default=Config.DEFAULT_TRANSACTION_COUNT,
-                        help=f"Number of recent transactions (default {Config.DEFAULT_TRANSACTION_COUNT})")
-    parser.add_argument("--csv", type=str, default=Config.DEFAULT_CSV_FILENAME,
-                        help=f"CSV output file (default {Config.DEFAULT_CSV_FILENAME})")
+    parser.add_argument(
+        "--count",
+        type=int,
+        default=Config.DEFAULT_TRANSACTION_COUNT,
+        help=f"Number of recent transactions (default {Config.DEFAULT_TRANSACTION_COUNT})",
+    )
+    parser.add_argument(
+        "--csv",
+        type=str,
+        default=Config.DEFAULT_CSV_FILENAME,
+        help=f"CSV output file (default {Config.DEFAULT_CSV_FILENAME})",
+    )
     args = parser.parse_args()
 
     logging.info(f"Querying address: {args.address}")
@@ -160,6 +209,7 @@ def main() -> None:
         logging.info(f"Total Received: {total_in:.4f} ETH | Total Sent: {total_out:.4f} ETH")
         save_transactions_to_csv(transactions, args.csv)
 
+# -------------------------------------------------------------------
 if __name__ == "__main__":
     try:
         main()
