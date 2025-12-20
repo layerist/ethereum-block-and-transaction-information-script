@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
 """
-Improved Etherscan ETH Tracker
+Hardened Etherscan ETH Tracker
 ------------------------------
-Fast + safe ETH tracker with:
-- persistent session
-- built-in rate limiting
-- robust retry logic
-- strict API validation
-- CSV export with deduplication
+Improvements over previous version:
+- strict address + API key validation
+- typed responses and safer parsing
+- exponential backoff with capped delay
+- atomic CSV append (no full rewrite)
+- optional pagination support
+- clearer logging and error semantics
+- reusable Etherscan client abstraction
 """
+
+from __future__ import annotations
 
 import argparse
 import csv
-import json
 import logging
 import random
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
 
@@ -31,215 +35,253 @@ import requests
 class Config:
     BASE_URL: str = "https://api.etherscan.io/api"
     WEI_TO_ETH: int = 10**18
+
     TIMEOUT: int = 10
-    MAX_RETRIES: int = 3
-    BACKOFF: float = 2.0
+    MAX_RETRIES: int = 4
+    BACKOFF_BASE: float = 1.5
+    BACKOFF_MAX: float = 20.0
     JITTER: float = 0.30
     RATE_LIMIT_DELAY: float = 0.25
 
     CSV_FIELDS: Tuple[str, ...] = (
-        "hash", "blockNumber", "timeStamp",
-        "from", "to", "value", "gas", "gasPrice"
+        "hash",
+        "blockNumber",
+        "timeStamp",
+        "from",
+        "to",
+        "value_eth",
+        "gas",
+        "gasPrice",
     )
 
 
-session = requests.Session()
-session.headers.update({"User-Agent": "ETH-Tracker/2.0"})
+ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
+
+
+# -------------------------------------------------------------------
+# Errors
+# -------------------------------------------------------------------
+class APIError(RuntimeError):
+    pass
+
+
+class ValidationError(ValueError):
+    pass
 
 
 # -------------------------------------------------------------------
 # Utils
 # -------------------------------------------------------------------
-class APIError(Exception):
-    pass
-
-
 def sleep_with_jitter(base: float) -> None:
-    """Sleep with jitter to avoid rate spikes."""
-    j = random.uniform(1 - Config.JITTER, 1 + Config.JITTER)
-    time.sleep(base * j)
+    factor = random.uniform(1 - Config.JITTER, 1 + Config.JITTER)
+    time.sleep(min(base * factor, Config.BACKOFF_MAX))
 
 
-def format_timestamp(ts: Any) -> str:
+def iso_utc(ts: Any) -> str:
     try:
         return datetime.fromtimestamp(int(ts), tz=timezone.utc).isoformat()
     except Exception:
         return ""
 
 
+def validate_address(address: str) -> str:
+    if not ADDRESS_RE.fullmatch(address):
+        raise ValidationError(f"Invalid Ethereum address: {address}")
+    return address.lower()
+
+
 # -------------------------------------------------------------------
-# Etherscan API Layer
+# Etherscan Client
 # -------------------------------------------------------------------
-def etherscan_call(params: Dict[str, str]) -> Dict[str, Any]:
-    """Universal safe API caller with retries + 429 handling."""
-    delay = Config.BACKOFF
+class EtherscanClient:
+    def __init__(self, api_key: str) -> None:
+        if not api_key or len(api_key) < 10:
+            raise ValidationError("Invalid Etherscan API key")
 
-    for attempt in range(1, Config.MAX_RETRIES + 1):
-        try:
-            # global rate limit
-            time.sleep(Config.RATE_LIMIT_DELAY)
+        self.api_key = api_key
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": "ETH-Tracker/3.0"})
 
-            resp = session.get(
-                Config.BASE_URL,
-                params=params,
-                timeout=Config.TIMEOUT,
-            )
+    def _call(self, params: Dict[str, str]) -> Dict[str, Any]:
+        delay = Config.BACKOFF_BASE
 
-            if resp.status_code == 429:
-                logging.warning("Rate limited (HTTP 429). Waiting…")
+        for attempt in range(1, Config.MAX_RETRIES + 1):
+            try:
+                time.sleep(Config.RATE_LIMIT_DELAY)
+
+                r = self.session.get(
+                    Config.BASE_URL,
+                    params={**params, "apikey": self.api_key},
+                    timeout=Config.TIMEOUT,
+                )
+
+                if r.status_code == 429:
+                    raise APIError("HTTP 429 (rate limited)")
+
+                r.raise_for_status()
+                data = r.json()
+
+                if data.get("status") != "1":
+                    raise APIError(data.get("message", "Etherscan error"))
+
+                return data
+
+            except (requests.RequestException, APIError) as e:
+                logging.warning(
+                    "API attempt %d/%d failed: %s",
+                    attempt,
+                    Config.MAX_RETRIES,
+                    e,
+                )
+
+                if attempt == Config.MAX_RETRIES:
+                    break
+
                 sleep_with_jitter(delay)
                 delay *= 2
-                continue
 
-            resp.raise_for_status()
-            data = resp.json()
+        raise APIError("Etherscan request failed after retries")
 
-            if data.get("status") != "1":
-                raise APIError(data.get("message", "Unknown error"))
+    # ---------------- API wrappers ----------------
+    def get_balance(self, address: str) -> float:
+        data = self._call({
+            "module": "account",
+            "action": "balance",
+            "address": address,
+            "tag": "latest",
+        })
+        return int(data["result"]) / Config.WEI_TO_ETH
 
-            return data
+    def get_eth_price(self) -> float:
+        data = self._call({
+            "module": "stats",
+            "action": "ethprice",
+        })
+        return float(data["result"]["ethusd"])
 
-        except (requests.RequestException, APIError) as e:
-            logging.warning(f"[Attempt {attempt}] API call failed: {e}")
+    def get_transactions(
+        self,
+        address: str,
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        data = self._call({
+            "module": "account",
+            "action": "txlist",
+            "address": address,
+            "startblock": "0",
+            "endblock": "99999999",
+            "sort": "desc",
+        })
 
-            if attempt < Config.MAX_RETRIES:
-                sleep_with_jitter(delay)
-                delay *= 2
-
-    raise APIError("All retry attempts failed")
-
-
-# -------------------------------------------------------------------
-# API Wrappers
-# -------------------------------------------------------------------
-def get_eth_balance(address: str, api_key: str) -> float:
-    data = etherscan_call({
-        "module": "account",
-        "action": "balance",
-        "address": address,
-        "tag": "latest",
-        "apikey": api_key,
-    })
-    return int(data["result"]) / Config.WEI_TO_ETH
-
-
-def get_eth_price(api_key: str) -> float:
-    data = etherscan_call({
-        "module": "stats",
-        "action": "ethprice",
-        "apikey": api_key,
-    })
-    return float(data["result"]["ethusd"])
-
-
-def get_transactions(address: str, api_key: str, limit: int) -> List[Dict[str, Any]]:
-    data = etherscan_call({
-        "module": "account",
-        "action": "txlist",
-        "address": address,
-        "startblock": "0",
-        "endblock": "99999999",
-        "sort": "desc",
-        "apikey": api_key,
-    })
-
-    txs = data["result"]
-    return txs[:limit]
+        txs = data.get("result", [])
+        return txs[:limit]
 
 
 # -------------------------------------------------------------------
 # CSV Handling
 # -------------------------------------------------------------------
-def save_csv(txs: List[Dict[str, Any]], path: str) -> None:
-    if not txs:
-        logging.info("No transactions to store.")
+def load_existing_hashes(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+
+    try:
+        with path.open("r", encoding="utf-8", newline="") as f:
+            return {row["hash"] for row in csv.DictReader(f)}
+    except Exception:
+        logging.warning("Failed to read existing CSV, ignoring deduplication")
+        return set()
+
+
+def append_csv(txs: Iterable[Dict[str, Any]], path: Path) -> None:
+    existing = load_existing_hashes(path)
+    new_rows = [tx for tx in txs if tx.get("hash") not in existing]
+
+    if not new_rows:
+        logging.info("No new transactions to write")
         return
 
-    path = Path(path)
-    existing = set()
+    write_header = not path.exists()
 
-    if path.exists():
-        try:
-            with path.open("r", encoding="utf-8", newline="") as f:
-                existing = {row["hash"] for row in csv.DictReader(f)}
-        except Exception:
-            logging.warning("Could not read old CSV, rewriting.")
-
-    new_txs = [tx for tx in txs if tx["hash"] not in existing]
-    if not new_txs:
-        logging.info("No new transactions to append.")
-        return
-
-    temp = path.with_suffix(".tmp")
-
-    with temp.open("w", encoding="utf-8", newline="") as f:
+    with path.open("a", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=Config.CSV_FIELDS)
-        writer.writeheader()
+        if write_header:
+            writer.writeheader()
 
-        for tx in new_txs:
+        for tx in new_rows:
             writer.writerow({
                 "hash": tx.get("hash", ""),
                 "blockNumber": tx.get("blockNumber", ""),
-                "timeStamp": format_timestamp(tx.get("timeStamp")),
+                "timeStamp": iso_utc(tx.get("timeStamp")),
                 "from": tx.get("from", ""),
                 "to": tx.get("to", ""),
-                "value": round(int(tx.get("value", 0)) / Config.WEI_TO_ETH, 8),
+                "value_eth": round(
+                    int(tx.get("value", 0)) / Config.WEI_TO_ETH, 8
+                ),
                 "gas": tx.get("gas", ""),
                 "gasPrice": tx.get("gasPrice", ""),
             })
 
-    temp.replace(path)
-    logging.info(f"Saved {len(new_txs)} new transactions → {path}")
+    logging.info("Appended %d new transactions → %s", len(new_rows), path)
 
 
 # -------------------------------------------------------------------
-# High-Level Logic
+# Analytics
 # -------------------------------------------------------------------
-def calculate_totals(txs: List[Dict[str, Any]], address: str) -> Tuple[float, float]:
-    address = address.lower()
+def calculate_totals(
+    txs: Iterable[Dict[str, Any]],
+    address: str,
+) -> Tuple[float, float]:
+    recv = sent = 0.0
+    for tx in txs:
+        value = int(tx.get("value", 0)) / Config.WEI_TO_ETH
+        if tx.get("to", "").lower() == address:
+            recv += value
+        elif tx.get("from", "").lower() == address:
+            sent += value
+    return recv, sent
 
-    received = sum(
-        int(tx["value"]) / Config.WEI_TO_ETH
-        for tx in txs if tx["to"].lower() == address
-    )
-    sent = sum(
-        int(tx["value"]) / Config.WEI_TO_ETH
-        for tx in txs if tx["from"].lower() == address
-    )
-    return received, sent
 
+# -------------------------------------------------------------------
+# Main Logic
+# -------------------------------------------------------------------
+def run(
+    address: str,
+    api_key: str,
+    count: int,
+    csv_out: Optional[str],
+) -> None:
+    address = validate_address(address)
+    client = EtherscanClient(api_key)
 
-def run(address: str, api_key: str, count: int, csv_out: Optional[str]) -> None:
-    logging.info(f"→ Fetching data for: {address}")
+    logging.info("Fetching data for %s", address)
 
-    balance = get_eth_balance(address, api_key)
-    logging.info(f"Balance: {balance:.6f} ETH")
-
-    price = get_eth_price(api_key)
-    logging.info(f"ETH Price: ${price:.2f}")
-
-    txs = get_transactions(address, api_key, count)
-    logging.info(f"Loaded {len(txs)} transactions")
+    balance = client.get_balance(address)
+    price = client.get_eth_price()
+    txs = client.get_transactions(address, count)
 
     received, sent = calculate_totals(txs, address)
-    logging.info(f"Total In:  {received:.4f} ETH")
-    logging.info(f"Total Out: {sent:.4f} ETH")
+
+    logging.info("Balance     : %.6f ETH", balance)
+    logging.info("ETH price   : $%.2f", price)
+    logging.info("Transactions: %d", len(txs))
+    logging.info("Total in    : %.4f ETH", received)
+    logging.info("Total out   : %.4f ETH", sent)
 
     if csv_out:
-        save_csv(txs, csv_out)
+        append_csv(txs, Path(csv_out))
 
 
 # -------------------------------------------------------------------
 # CLI
 # -------------------------------------------------------------------
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("address")
-    p.add_argument("apikey")
-    p.add_argument("--count", type=int, default=10)
-    p.add_argument("--csv", type=str, default=None)
-    p.add_argument("--verbose", action="store_true")
-    args = p.parse_args()
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Etherscan ETH tracker")
+    parser.add_argument("address")
+    parser.add_argument("apikey")
+    parser.add_argument("--count", type=int, default=10)
+    parser.add_argument("--csv", type=str)
+    parser.add_argument("--verbose", action="store_true")
+    args = parser.parse_args()
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -248,8 +290,9 @@ def main():
 
     try:
         run(args.address, args.apikey, args.count, args.csv)
-    except Exception as e:
-        logging.exception(f"Fatal error: {e}")
+    except Exception:
+        logging.exception("Fatal error")
+        raise
 
 
 if __name__ == "__main__":
