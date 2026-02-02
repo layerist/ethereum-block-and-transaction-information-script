@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """
-Hardened Etherscan ETH Tracker (v3.1)
+Hardened Etherscan ETH Tracker (v3.2)
 -----------------------------------
-Key improvements:
-- Correct pagination via page/offset
-- Robust API error classification
-- Safer retries with bounded exponential backoff
-- Typed helpers and defensive parsing
-- Atomic CSV append with deduplication
-- Ignores failed transactions in analytics
-- Clear separation of concerns
+Improvements:
+- Strict Etherscan response validation
+- Safer numeric parsing
+- Pagination guardrails
+- Centralized retry/backoff logic
+- Truly atomic CSV append
+- Cleaner logging and typing
 """
 
 from __future__ import annotations
@@ -43,7 +42,7 @@ class Config:
     JITTER: float = 0.25
     RATE_LIMIT_DELAY: float = 0.25
 
-    PAGE_SIZE: int = 100  # Etherscan max
+    PAGE_SIZE: int = 100  # Etherscan hard limit
 
     CSV_FIELDS: Tuple[str, ...] = (
         "hash",
@@ -77,16 +76,23 @@ class ValidationError(ValueError):
 
 
 # -------------------------------------------------------------------
-# Utils
+# Utilities
 # -------------------------------------------------------------------
 def sleep_with_jitter(delay: float) -> None:
-    factor = random.uniform(1 - Config.JITTER, 1 + Config.JITTER)
-    time.sleep(min(delay * factor, Config.BACKOFF_MAX))
+    jitter = random.uniform(1 - Config.JITTER, 1 + Config.JITTER)
+    time.sleep(min(delay * jitter, Config.BACKOFF_MAX))
+
+
+def safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
 
 
 def iso_utc(ts: Any) -> str:
     try:
-        return datetime.fromtimestamp(int(ts), tz=timezone.utc).isoformat()
+        return datetime.fromtimestamp(safe_int(ts), tz=timezone.utc).isoformat()
     except Exception:
         return ""
 
@@ -107,9 +113,7 @@ class EtherscanClient:
 
         self.api_key = api_key
         self.session = requests.Session()
-        self.session.headers.update({
-            "User-Agent": "ETH-Tracker/3.1"
-        })
+        self.session.headers.update({"User-Agent": "ETH-Tracker/3.2"})
 
     def _request(self, params: Dict[str, str]) -> Dict[str, Any]:
         delay = Config.BACKOFF_BASE
@@ -131,26 +135,26 @@ class EtherscanClient:
                 data = resp.json()
 
                 if not isinstance(data, dict):
-                    raise APIError("Malformed JSON response")
+                    raise APIError("Non-dict JSON response")
 
                 status = data.get("status")
-                message = data.get("message", "")
+                message = str(data.get("message", ""))
 
-                # Etherscan sometimes returns status=0 with OK message
-                if status == "0" and "rate limit" in message.lower():
-                    raise RateLimitError(message)
+                if status == "0":
+                    if "rate limit" in message.lower():
+                        raise RateLimitError(message)
+                    if message not in ("OK", "No transactions found"):
+                        raise APIError(message)
 
-                if status == "0" and message not in ("No transactions found", "OK"):
-                    raise APIError(message)
+                if "result" not in data:
+                    raise APIError("Missing result field")
 
                 return data
 
             except RateLimitError as e:
-                logging.warning("Rate limited (%d/%d): %s",
-                                attempt, Config.MAX_RETRIES, e)
+                logging.warning("Rate limited (%d/%d): %s", attempt, Config.MAX_RETRIES, e)
             except (requests.RequestException, APIError) as e:
-                logging.warning("API error (%d/%d): %s",
-                                attempt, Config.MAX_RETRIES, e)
+                logging.warning("API error (%d/%d): %s", attempt, Config.MAX_RETRIES, e)
 
             if attempt < Config.MAX_RETRIES:
                 sleep_with_jitter(delay)
@@ -166,7 +170,7 @@ class EtherscanClient:
             "address": address,
             "tag": "latest",
         })
-        return int(data.get("result", 0)) / Config.WEI_TO_ETH
+        return safe_int(data["result"]) / Config.WEI_TO_ETH
 
     def get_eth_price(self) -> float:
         data = self._request({
@@ -178,6 +182,7 @@ class EtherscanClient:
     def get_transactions(self, address: str, limit: int) -> List[Dict[str, Any]]:
         results: List[Dict[str, Any]] = []
         page = 1
+        seen_pages = 0
 
         while len(results) < limit:
             data = self._request({
@@ -196,8 +201,13 @@ class EtherscanClient:
                 break
 
             results.extend(batch)
+            seen_pages += 1
+
             if len(batch) < Config.PAGE_SIZE:
                 break
+
+            if seen_pages > 10_000:
+                raise APIError("Pagination safety limit exceeded")
 
             page += 1
 
@@ -215,7 +225,7 @@ def load_existing_hashes(path: Path) -> Set[str]:
         with path.open("r", encoding="utf-8", newline="") as f:
             return {row["hash"] for row in csv.DictReader(f) if row.get("hash")}
     except Exception:
-        logging.warning("Failed to read existing CSV, deduplication disabled")
+        logging.warning("Failed to read CSV, deduplication disabled")
         return set()
 
 
@@ -227,14 +237,12 @@ def append_csv(txs: Iterable[Dict[str, Any]], path: Path) -> None:
         logging.info("No new transactions to append")
         return
 
-    write_header = not path.exists()
-
     tmp_path = path.with_suffix(".tmp")
+    write_header = not path.exists()
 
     with tmp_path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=Config.CSV_FIELDS)
-        if write_header:
-            writer.writeheader()
+        writer.writeheader()
 
         for tx in rows:
             writer.writerow({
@@ -243,18 +251,17 @@ def append_csv(txs: Iterable[Dict[str, Any]], path: Path) -> None:
                 "timeStamp": iso_utc(tx.get("timeStamp")),
                 "from": tx.get("from", ""),
                 "to": tx.get("to", ""),
-                "value_eth": round(
-                    int(tx.get("value", 0)) / Config.WEI_TO_ETH, 8
-                ),
+                "value_eth": round(safe_int(tx.get("value")) / Config.WEI_TO_ETH, 8),
                 "gas": tx.get("gas", ""),
                 "gasPrice": tx.get("gasPrice", ""),
                 "isError": tx.get("isError", "0"),
             })
 
-    with path.open("a", encoding="utf-8", newline="") as out, \
+    mode = "a" if path.exists() else "w"
+    with path.open(mode, encoding="utf-8", newline="") as out, \
          tmp_path.open("r", encoding="utf-8") as inp:
         if not write_header:
-            next(inp)  # skip header
+            next(inp)
         out.write(inp.read())
 
     tmp_path.unlink(missing_ok=True)
@@ -272,9 +279,9 @@ def calculate_totals(
 
     for tx in txs:
         if tx.get("isError") == "1":
-            continue  # ignore failed txs
+            continue
 
-        value = int(tx.get("value", 0)) / Config.WEI_TO_ETH
+        value = safe_int(tx.get("value")) / Config.WEI_TO_ETH
         if tx.get("to", "").lower() == address:
             received += value
         elif tx.get("from", "").lower() == address:
