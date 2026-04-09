@@ -9,18 +9,19 @@ import random
 import re
 import signal
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, getcontext
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set
 
 import requests
 
+# High precision for ETH math
 getcontext().prec = 50
-
 
 # -------------------------------------------------------------------
 # Config
@@ -31,16 +32,18 @@ class Config:
     WEI_TO_ETH: Decimal = Decimal("1000000000000000000")
 
     TIMEOUT: int = 10
-    MAX_RETRIES: int = 5
-    BACKOFF_BASE: float = 1.2
-    BACKOFF_MAX: float = 20.0
-    JITTER: float = 0.2
+    MAX_RETRIES: int = 6
+    BACKOFF_BASE: float = 1.3
+    BACKOFF_MAX: float = 30.0
+    JITTER: float = 0.25
+
     RATE_LIMIT_DELAY: float = 0.2
 
     PAGE_SIZE: int = 100
     MAX_PAGES: int = 10_000
+    MAX_WORKERS: int = 4  # safe for Etherscan
 
-    CSV_FIELDS: Tuple[str, ...] = (
+    CSV_FIELDS = (
         "hash",
         "blockNumber",
         "timeStamp",
@@ -55,7 +58,6 @@ class Config:
 
 ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
 
-
 # -------------------------------------------------------------------
 # Errors
 # -------------------------------------------------------------------
@@ -68,13 +70,14 @@ class ValidationError(ValueError): ...
 # Utils
 # -------------------------------------------------------------------
 def sleep_with_jitter(delay: float) -> None:
-    time.sleep(min(delay * random.uniform(0.8, 1.2), Config.BACKOFF_MAX))
+    jitter = random.uniform(1 - Config.JITTER, 1 + Config.JITTER)
+    time.sleep(min(delay * jitter, Config.BACKOFF_MAX))
 
 
 def safe_decimal(value: Any) -> Decimal:
     try:
         return Decimal(str(value))
-    except Exception:
+    except (InvalidOperation, TypeError):
         return Decimal(0)
 
 
@@ -101,6 +104,10 @@ class EtherscanClient:
 
         self.api_key = api_key
         self.session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10)
+        self.session.mount("https://", adapter)
+
+        self._lock = threading.Lock()
 
     def close(self):
         self.session.close()
@@ -111,6 +118,7 @@ class EtherscanClient:
     def __exit__(self, *args):
         self.close()
 
+    # ---------------- Core request ----------------
     def _request(self, params: Dict[str, str]) -> Dict[str, Any]:
         delay = Config.BACKOFF_BASE
 
@@ -125,18 +133,20 @@ class EtherscanClient:
                 )
 
                 if r.status_code == 429:
-                    raise RateLimitError()
+                    raise RateLimitError("HTTP 429")
+
+                if r.status_code >= 500:
+                    raise APIError(f"Server error {r.status_code}")
 
                 r.raise_for_status()
-                data = r.json()
 
+                data = r.json()
                 if not isinstance(data, dict):
-                    raise APIError("Bad JSON")
+                    raise APIError("Invalid JSON")
 
                 status = str(data.get("status"))
                 message = str(data.get("message", "")).lower()
 
-                # Etherscan quirks handling
                 if status == "0":
                     if "rate limit" in message:
                         raise RateLimitError(message)
@@ -148,7 +158,7 @@ class EtherscanClient:
                 return data
 
             except RateLimitError:
-                logging.warning("Rate limited (%d)", attempt + 1)
+                logging.warning("Rate limited (attempt %d)", attempt + 1)
             except Exception as e:
                 logging.warning("Request error (%d): %s", attempt + 1, e)
 
@@ -176,66 +186,79 @@ class EtherscanClient:
         })
         return safe_decimal(r["result"]["ethusd"])
 
+    # ---------------- Transactions ----------------
+    def _fetch_page(self, address: str, page: int) -> List[Dict[str, Any]]:
+        r = self._request({
+            "module": "account",
+            "action": "txlist",
+            "address": address,
+            "page": str(page),
+            "offset": str(Config.PAGE_SIZE),
+            "sort": "desc",
+        })
+        return r.get("result", [])
+
     def get_transactions(self, address: str, limit: int) -> List[Dict[str, Any]]:
-        out: List[Dict[str, Any]] = []
+        results: List[Dict[str, Any]] = []
+        stop_flag = threading.Event()
 
-        for page in range(1, Config.MAX_PAGES + 1):
-            if len(out) >= limit:
-                break
+        def worker(page: int):
+            if stop_flag.is_set():
+                return []
 
-            r = self._request({
-                "module": "account",
-                "action": "txlist",
-                "address": address,
-                "page": str(page),
-                "offset": str(Config.PAGE_SIZE),
-                "sort": "desc",
-            })
+            batch = self._fetch_page(address, page)
 
-            batch = r.get("result", [])
             if not batch:
-                break
+                stop_flag.set()
+                return []
 
-            out.extend(batch)
+            return batch
 
-            if len(batch) < Config.PAGE_SIZE:
-                break  # last page
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        return out[:limit]
+        with ThreadPoolExecutor(max_workers=Config.MAX_WORKERS) as ex:
+            futures = {
+                ex.submit(worker, page): page
+                for page in range(1, Config.MAX_PAGES + 1)
+            }
+
+            for future in as_completed(futures):
+                batch = future.result()
+                if not batch:
+                    continue
+
+                results.extend(batch)
+
+                if len(results) >= limit:
+                    stop_flag.set()
+                    break
+
+        return results[:limit]
 
 
 # -------------------------------------------------------------------
-# CSV (TRUE atomic)
+# CSV (true append-safe atomic)
 # -------------------------------------------------------------------
-def atomic_write_csv(
-    path: Path,
-    rows: Iterable[Dict[str, Any]],
-):
-    existing: Set[str] = set()
+def atomic_write_csv(path: Path, rows: Iterable[Dict[str, Any]]):
+
+    existing_hashes: Set[str] = set()
 
     if path.exists():
         with path.open("r", encoding="utf-8") as f:
-            existing = {r["hash"] for r in csv.DictReader(f)}
+            existing_hashes = {r["hash"] for r in csv.DictReader(f)}
 
-    new_rows = [r for r in rows if r.get("hash") not in existing]
+    new_rows = []
+    for tx in rows:
+        h = tx.get("hash")
+        if not h or h in existing_hashes:
+            continue
 
-    if not new_rows:
-        logging.info("No new rows")
-        return
-
-    all_rows = []
-
-    if path.exists():
-        with path.open("r", encoding="utf-8") as f:
-            all_rows.extend(list(csv.DictReader(f)))
-
-    for tx in new_rows:
         val = (safe_decimal(tx["value"]) / Config.WEI_TO_ETH).quantize(
             Decimal("0.00000001")
         )
 
-        all_rows.append({
-            "hash": tx.get("hash", ""),
+        new_rows.append({
+            "hash": h,
             "blockNumber": tx.get("blockNumber", ""),
             "timeStamp": iso_utc(tx.get("timeStamp")),
             "from": tx.get("from", ""),
@@ -246,22 +269,32 @@ def atomic_write_csv(
             "isError": tx.get("isError", "0"),
         })
 
+    if not new_rows:
+        logging.info("No new rows")
+        return
+
     tmp = path.with_suffix(".tmp")
 
+    # append old + new efficiently
     with tmp.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=Config.CSV_FIELDS)
         writer.writeheader()
-        writer.writerows(all_rows)
+
+        if path.exists():
+            with path.open("r", encoding="utf-8") as old:
+                for row in csv.DictReader(old):
+                    writer.writerow(row)
+
+        writer.writerows(new_rows)
 
     os.replace(tmp, path)
-
     logging.info("CSV updated: +%d rows", len(new_rows))
 
 
 # -------------------------------------------------------------------
 # Analytics
 # -------------------------------------------------------------------
-def calculate_totals(txs, address):
+def calculate_totals(txs: List[Dict[str, Any]], address: str):
     recv = Decimal(0)
     sent = Decimal(0)
 
@@ -280,37 +313,48 @@ def calculate_totals(txs, address):
 
 
 # -------------------------------------------------------------------
-# Main
+# Main logic
 # -------------------------------------------------------------------
-def run(address, key, count, csv_out):
+def run(address: str, key: str, count: int, csv_out: Optional[str]):
+
     address = validate_address(address)
 
-    with EtherscanClient(key) as c:
-        bal = c.get_balance(address)
-        price = c.get_eth_price()
-        txs = c.get_transactions(address, count)
+    with EtherscanClient(key) as client:
+        start = time.time()
+
+        balance = client.get_balance(address)
+        price = client.get_eth_price()
+        txs = client.get_transactions(address, count)
+
+        elapsed = time.time() - start
 
     recv, sent = calculate_totals(txs, address)
 
-    logging.info(f"Balance: {bal} ETH")
-    logging.info(f"Price  : ${price}")
-    logging.info(f"Txs    : {len(txs)}")
-    logging.info(f"In     : {recv}")
-    logging.info(f"Out    : {sent}")
+    logging.info("Balance: %.6f ETH (~$%.2f)", balance, balance * price)
+    logging.info("Price  : $%s", price)
+    logging.info("Txs    : %d", len(txs))
+    logging.info("In     : %.6f ETH", recv)
+    logging.info("Out    : %.6f ETH", sent)
+    logging.info("Time   : %.2fs", elapsed)
 
     if csv_out:
         atomic_write_csv(Path(csv_out), txs)
 
 
 # -------------------------------------------------------------------
+# CLI
+# -------------------------------------------------------------------
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("address")
-    p.add_argument("apikey")
-    p.add_argument("--count", type=int, default=50)
-    p.add_argument("--csv")
-    p.add_argument("--verbose", action="store_true")
-    args = p.parse_args()
+    parser = argparse.ArgumentParser(description="Etherscan advanced client")
+
+    parser.add_argument("address", help="Ethereum address")
+    parser.add_argument("apikey", help="Etherscan API key")
+
+    parser.add_argument("--count", type=int, default=50)
+    parser.add_argument("--csv", help="Output CSV file")
+    parser.add_argument("--verbose", action="store_true")
+
+    args = parser.parse_args()
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
