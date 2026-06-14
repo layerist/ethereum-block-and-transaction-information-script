@@ -45,17 +45,17 @@ class Config:
     TIMEOUT_READ: int = 20
 
     # Retry
-    MAX_RETRIES: int = 8
+    MAX_RETRIES: int = 10
     BACKOFF_BASE: float = 1.5
     BACKOFF_MAX: float = 30.0
     JITTER: float = 0.25
 
     # Etherscan free tier safe rate
-    REQUESTS_PER_SECOND: float = 4.5
+    REQUESTS_PER_SECOND: float = 4.8
 
     # Transactions
     PAGE_SIZE: int = 100
-    MAX_WORKERS: int = 6
+    MAX_WORKERS: int = min(12, (os.cpu_count() or 4) * 2)
     MAX_EMPTY_PAGES: int = 2
 
     # HTTP Pool
@@ -193,7 +193,7 @@ class RateLimiter:
                     self.tokens -= 1
                     return
 
-            time.sleep(0.01)
+            time.sleep(0.005)
 
 
 # ============================================================
@@ -229,7 +229,7 @@ class EtherscanClient:
         self.session.mount("https://", adapter)
 
         self.session.headers.update({
-            "User-Agent": "Advanced-Etherscan-Client/2.0",
+            "User-Agent": "Advanced-Etherscan-Client/3.0",
             "Accept": "application/json",
             "Connection": "keep-alive",
         })
@@ -358,6 +358,18 @@ class EtherscanClient:
 
         result = data.get("result", {})
         return safe_decimal(result.get("ethusd"))
+
+
+    @lru_cache(maxsize=1)
+    def get_gas_oracle(self) -> Dict[str, Any]:
+        try:
+            data = self._request({
+                "module": "gastracker",
+                "action": "gasoracle",
+            })
+            return data.get("result", {})
+        except Exception:
+            return {}
 
     # --------------------------------------------------------
     # Transactions
